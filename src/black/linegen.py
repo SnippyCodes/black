@@ -2,6 +2,7 @@
 Generating lines of code.
 """
 
+import doctest
 import re
 import sys
 from collections.abc import Collection, Iterator
@@ -74,6 +75,7 @@ from black.nodes import (
     wrap_in_parentheses,
 )
 from black.numerics import normalize_numeric_literal
+from black.parsing import lib2to3_parse
 from black.strings import (
     fix_multiline_docstring,
     get_string_prefix,
@@ -96,6 +98,126 @@ from blib2to3.pytree import Leaf, Node
 # types
 LeafID = int
 LN = Union[Leaf, Node]
+
+
+def format_doctest(docstring: str, mode: Mode, features: Collection[Feature]) -> str:
+    """Format code in doctest examples within a docstring.
+
+    Parses the docstring for doctest examples (lines starting with >>> or ...),
+    formats the Python code, and reconstructs the docstring with formatted examples.
+    """
+    if not docstring or not docstring.strip():
+        return docstring
+
+    # Determine and strip common indentation (similar to fix_multiline_docstring)
+    lines = docstring.splitlines(keepends=True)
+    if not lines:
+        return docstring
+
+    # Find minimum indentation (excluding first line and empty lines)
+    min_indent = sys.maxsize
+    for line in lines[1:]:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith('\n'):
+            indent_len = len(line) - len(stripped)
+            min_indent = min(min_indent, indent_len)
+
+    # Strip the common indentation
+    if min_indent < sys.maxsize:
+        dedented_lines = [lines[0]]  # First line stays as-is
+        for line in lines[1:]:
+            if len(line) > min_indent:
+                dedented_lines.append(line[min_indent:])
+            else:
+                dedented_lines.append(line)
+        dedented_docstring = "".join(dedented_lines)
+    else:
+        dedented_docstring = docstring
+
+    # Parse the dedented docstring for doctests
+    parser = doctest.DocTestParser()
+    try:
+        examples = parser.parse(dedented_docstring)
+    except Exception:
+        # If parsing fails, return the original docstring
+        return docstring
+
+    result_parts = []
+    for part in examples:
+        if isinstance(part, str):
+            # Plain text, keep as-is
+            result_parts.append(part)
+        elif isinstance(part, doctest.Example):
+            # This is a doctest example, format the source code
+            try:
+                # Extract the source code
+                source = part.source
+
+                # Parse and format the source
+                src_node = lib2to3_parse(source, mode.target_versions)
+
+                # Create a temporary line generator to format this snippet
+                from black.lines import EmptyLineTracker, LinesBlock
+
+                line_generator = LineGenerator(mode=mode, features=features)
+                elt = EmptyLineTracker(mode=mode)
+                dst_blocks: list[LinesBlock] = []
+
+                for current_line in line_generator.visit(src_node):
+                    block = elt.maybe_empty_lines(current_line)
+                    dst_blocks.append(block)
+                    for transformed_line in transform_line(
+                        current_line, mode=mode, features=features
+                    ):
+                        block.content_lines.append(str(transformed_line))
+
+                # Collect formatted lines
+                dst_contents = []
+                for block in dst_blocks:
+                    dst_contents.extend(block.all_lines())
+
+                formatted_source = "".join(dst_contents)
+
+                # Add prompts back to the formatted code
+                formatted_lines = formatted_source.rstrip("\n").split("\n")
+                if formatted_lines:
+                    # First line gets >>>
+                    result_parts.append(">>> " + formatted_lines[0] + "\n")
+                    # Continuation lines get ...
+                    for line in formatted_lines[1:]:
+                        result_parts.append("... " + line + "\n")
+
+                # Add the expected output if any
+                if part.want:
+                    result_parts.append(part.want)
+
+            except Exception:
+                # If formatting fails, keep the original example
+                # Reconstruct with prompts
+                source_lines = part.source.rstrip("\n").split("\n")
+                if source_lines:
+                    result_parts.append(">>> " + source_lines[0] + "\n")
+                    for line in source_lines[1:]:
+                        result_parts.append("... " + line + "\n")
+                if part.want:
+                    result_parts.append(part.want)
+
+    formatted_docstring = "".join(result_parts)
+
+    # Re-apply the indentation to all lines except the first
+    if min_indent < sys.maxsize and min_indent > 0:
+        formatted_lines = formatted_docstring.splitlines(keepends=True)
+        if formatted_lines:
+            indented_lines = [formatted_lines[0]]
+            indent_str = " " * min_indent
+            for line in formatted_lines[1:]:
+                if line.strip():  # Only indent non-empty lines
+                    indented_lines.append(indent_str + line)
+                else:
+                    indented_lines.append(line)
+            return "".join(indented_lines)
+
+    return formatted_docstring
 
 
 class CannotSplit(CannotTransform):
@@ -493,6 +615,10 @@ class LineGenerator(Visitor[Line]):
             docstring_started_empty = not docstring
             indent = " " * 4 * self.current_line.depth
 
+            # Format doctest examples within the docstring (before indentation is added)
+            if docstring:
+                docstring = format_doctest(docstring, self.mode, self.features)
+
             if is_multiline_string(leaf):
                 docstring = fix_multiline_docstring(docstring, indent)
             else:
@@ -725,7 +851,6 @@ def transform_line(
         and not line.magic_trailing_comma
         and (
             is_line_short_enough(line, mode=mode, line_str=line_str_hugging_power_ops)
-            or line.contains_unsplittable_type_ignore()
         )
         and not (line.inside_brackets and line.contains_standalone_comments())
         and not line.contains_implicit_multiline_string_with_comments()

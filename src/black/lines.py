@@ -927,7 +927,7 @@ def can_be_split(line: Line) -> bool:
     """
     leaves = line.leaves
     if len(leaves) < 2:
-        return False
+        return leaves[0].type == token.STRING
 
     if leaves[0].type == token.STRING and leaves[1].type == token.DOT:
         call_count = 0
